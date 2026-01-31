@@ -1,0 +1,140 @@
+name: AI Developer (Headless)
+
+on:
+  schedule:
+    # Runs at 14:00 UTC (8:00 AM CST) every day
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+    # Allows you to click "Run workflow" manually from GitHub Actions tab
+
+permissions:
+  contents: write       # Needed to commit code
+  issues: write         # Needed to edit labels
+  pull-requests: write  # Needed to create PRs
+
+jobs:
+  process-task:
+    runs-on: ubuntu-latest
+    concurrency: 
+      group: ai-dev-queue
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' 
+
+      - name: Install OpenAI Library
+        run: pip install openai
+
+      - name: Pick a Task (Oldest 'ai:todo')
+        id: pick_task
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Fetch oldest open issue labeled 'ai:todo'
+          TASK_JSON=$(gh issue list --label "ai:todo" --state open --limit 1 --json number,title,body --order asc)
+          
+          # 2. Check if we found anything
+          if [ "$TASK_JSON" = "[]" ]; then
+            echo "No tasks found. Exiting."
+            echo "has_task=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 3. Extract details
+          ISSUE_NUMBER=$(echo $TASK_JSON | jq -r '.[0].number')
+          ISSUE_TITLE=$(echo $TASK_JSON | jq -r '.[0].title')
+          ISSUE_BODY=$(echo $TASK_JSON | jq -r '.[0].body')
+
+          echo "Found Issue #$ISSUE_NUMBER: $ISSUE_TITLE"
+          
+          # 4. Claim the issue (Label: ai:in-progress)
+          gh issue edit "$ISSUE_NUMBER" --add-label "ai:in-progress" --remove-label "ai:todo"
+          
+          # 5. Export variables for next steps
+          echo "has_task=true" >> $GITHUB_OUTPUT
+          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          
+          # 6. Prepare prompt string (Context + Task)
+          # Clean inputs to prevent JSON breaking in shell
+          CLEAN_TITLE=$(echo "$ISSUE_TITLE")
+          CLEAN_BODY=$(echo "$ISSUE_BODY")
+          
+          # Capture file tree (ignoring .git and hidden files)
+          FILE_TREE=$(find . -maxdepth 3 -not -path '*/.*')
+          
+          # Create a safe multi-line environment variable
+          {
+            echo "task_prompt<<EOF"
+            echo "REPO CONTEXT (File Tree):"
+            echo "$FILE_TREE"
+            echo ""
+            echo "TASK TITLE: $CLEAN_TITLE"
+            echo "TASK DESCRIPTION:"
+            echo "$CLEAN_BODY"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Run Agent (OpenRouter)
+        if: steps.pick_task.outputs.has_task == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TASK_PAYLOAD: ${{ steps.pick_task.outputs.task_prompt }}
+        run: |
+          # Runs your script which calls OpenRouter -> outputs solution.json
+          python .github/scripts/run_agent.py > solution.json
+          
+          # Debug: print the first few lines to verify JSON started
+          head -n 5 solution.json
+
+      - name: Apply Changes & Create PR
+        if: steps.pick_task.outputs.has_task == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.pick_task.outputs.issue_number }}
+        run: |
+          # 1. Parse JSON Plan
+          BRANCH=$(jq -r '.branch_name' solution.json)
+          MSG=$(jq -r '.commit_message' solution.json)
+          TITLE=$(jq -r '.pr_title' solution.json)
+          BODY=$(jq -r '.pr_body' solution.json)
+
+          echo "Preparing branch: $BRANCH"
+
+          # 2. Setup Git Identity
+          git config user.name "AI Agent"
+          git config user.email "ai-agent@users.noreply.github.com"
+
+          # 3. Create Branch
+          git checkout -b "$BRANCH"
+
+          # 4. Write Files (Loop through JSON array)
+          jq -c '.files[]' solution.json | while read i; do
+            PATH=$(echo "$i" | jq -r '.path')
+            
+            # Ensure directory exists
+            mkdir -p "$(dirname "$PATH")"
+            
+            # Write content to file
+            echo "$i" | jq -r '.content' > "$PATH"
+            
+            # Stage file
+            git add "$PATH"
+          done
+
+          # 5. Commit and Push
+          git commit -m "$MSG"
+          git push origin "$BRANCH"
+
+          # 6. Open PR
+          gh pr create \
+            --title "$TITLE" \
+            --body "$BODY Closes #$ISSUE_NUM" \
+            --base main \
+            --head "$BRANCH"
+
