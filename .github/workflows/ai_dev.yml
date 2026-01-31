@@ -37,7 +37,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 1. Fetch oldest open issue labeled 'ai:todo'
-          TASK_JSON=$(gh issue list --label "ai:todo" --state open --limit 1 --json number,title,body --order asc)
+          TASK_JSON=$(gh issue list --label "ai:todo" --state open --limit 1 --json number,title,body)
           
           # 2. Check if we found anything
           if [ "$TASK_JSON" = "[]" ]; then
